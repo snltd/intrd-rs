@@ -4,10 +4,8 @@ use log::{debug, info};
 use signal_hook::consts::signal::*;
 use signal_hook::iterator::Signals;
 use simplelog::{ColorChoice, Config, LevelFilter, TermLogger, TerminalMode};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 mod util;
@@ -15,24 +13,19 @@ use anyhow::anyhow;
 use anyhow::Context;
 use std::env;
 
-const SYSLOG_PROCESS_NAME: &str = "intrd-rs";
-
-// my $normal_sleeptime = 10;		# time to sleep between samples
-const NORMAL_SLEEP_TIME: usize = 10;
-// my $idle_sleeptime = 45;		# time to sleep when idle
-const IDLE_SLEEP_TIME: usize = 45;
-// my $onecpu_sleeptime = (60 * 15);	# used if only 1 CPU on system
-const SINGLE_CPU_SLEEP_TIME: usize = (60 * 15);
-//
-// my $sleeptime = $normal_sleeptime;	# either normal_ or idle_ or onecpu_
-
-// my $idle_intrload = .1;			# idle if interrupt load < 10%
-const IDLE_INTR_LOAD: f32 = 0.1;
-
-// my $timerange_toohi    = .01;
+const SYSLOG_PROCESS_NAME: &str = "intrd-rs"; // my name
+const USING_SCENGEN: bool = false; // I probably won't implement this.
+const NORMAL_SLEEP_TIME: u64 = 10; // time to sleep between samples
+const IDLE_SLEEP_TIME: u64 = 45; // time to sleep when idle
+const SINGLE_CPU_SLEEP_TIME: u64 = (60 * 15); // used only on single CPU systems
+const IDLE_INTR_LOAD: f32 = 0.1; // idle if interrupt load < 10%
 const TIME_RANGE_TOO_HIGH: f32 = 0.01;
-// my $statslen = 60;	# time period (in secs) to keep in @deltas
-const STATS_LEN: usize = 60;
+const STATS_LEN: usize = 60; // time period (in secs) to keep in deltas
+
+// This will end up being something more sophisticated, I'm sure
+type Delta = usize;
+type Deltas = Vec<Delta>;
+type DeltasTotalTime = usize;
 
 fn setup_signal_handler() -> Arc<AtomicBool> {
     let gotsig = Arc::new(AtomicBool::new(false));
@@ -54,14 +47,19 @@ fn get_pci_intr_kstats() {
     todo!()
 }
 
-fn getstat() {
+// getstat() is responsible for reading the kstats and generating a "stat" hash.
+fn getstat(ctl: &Ctl, is_apic: bool) {
     // 2 args
-    todo!()
 }
+
+// generate_delta() is responsible for taking two "stat" hashes and creating a new "delta" hash
+// that represents what has changed over time.
 fn generate_delta() {
     // 2 args
     todo!()
 }
+
+// compress_deltas() is responsible for taking a list of deltas and generating a single delta hash that encompasses all the time periods described by the deltas.
 fn compress_deltas() {
     // 1 arg
     todo!()
@@ -208,8 +206,7 @@ fn main() -> anyhow::Result<()> {
     // let ret;
     // my $ret;
     //
-    let ctl = Ctl::new().context("Cannot get kstat handle")?;
-
+    let mut ctl = Ctl::new().context("Cannot get kstat handle")?;
     let mut intr_stats: Vec<_> = ctl.filter(Some("pci_intrs"), None, None).collect();
 
     // # If no pci_intrs kstats were found, we need to exit, but we can't because
@@ -237,24 +234,30 @@ fn main() -> anyhow::Result<()> {
     // # Such systems will get special handling.
     // # Assume that if one bus has a pcplusmp APIC that they all do.
 
-    let is_apic = is_apic_system(&ctl, first_stat);
+    let is_apic = is_apic_system(&ctl, first_stat)?;
 
     debug!("APIC system: {:?}", is_apic);
-
-    // This will end up being something more sophisticated, I'm sure
-    // type Delta = usize;
-
-    // type Deltas = Vec<Delta>;
-
-    // type DeltasTotalTime = usize;
+    let mut sleep_time = NORMAL_SLEEP_TIME;
 
     while !gotsig.load(Ordering::SeqCst) {
         // clear deltas
         // let mut deltas: Deltas = Vec::new();
         // let mut deltas_total_time: DeltasTotalTime = 0;
+
+        debug!("loop!");
         // let mut stat = 0;
 
-        // # 1. Sleep, update the kstats, and save the new stats in $newstat.
+        // 1. Sleep, update the kstats, and save the new stats in $newstat.
+        //
+        if USING_SCENGEN {
+            debug!("scenario generator is not implemented");
+        } else {
+            thread::sleep(Duration::from_secs(sleep_time));
+            ctl = ctl.update()?;
+        }
+
+        let stats = getstat(&ctl, is_apic);
+
         // # 2. Compare $newstat with the prior set of values, result in %$delta.
 
         // # 3. If $delta->{missing}, then there has been a reconfiguration of
