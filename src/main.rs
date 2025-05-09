@@ -1,55 +1,88 @@
-use crate::util::is_apic;
+use crate::util::constants::{NORMAL_SLEEP_TIME, SYSLOG_PROCESS_NAME, USING_SCENGEN};
+use crate::util::helpers;
 use kstat_rs::{Ctl, Kstat, NamedData};
 use log::{debug, info};
-use signal_hook::consts::signal::*;
-use signal_hook::iterator::Signals;
 use simplelog::{ColorChoice, Config, LevelFilter, TermLogger, TerminalMode};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 mod util;
 use anyhow::anyhow;
 use anyhow::Context;
-use std::env;
-
-const SYSLOG_PROCESS_NAME: &str = "intrd-rs"; // my name
-const USING_SCENGEN: bool = false; // I probably won't implement this.
-const NORMAL_SLEEP_TIME: u64 = 10; // time to sleep between samples
-const IDLE_SLEEP_TIME: u64 = 45; // time to sleep when idle
-const SINGLE_CPU_SLEEP_TIME: u64 = (60 * 15); // used only on single CPU systems
-const IDLE_INTR_LOAD: f32 = 0.1; // idle if interrupt load < 10%
-const TIME_RANGE_TOO_HIGH: f32 = 0.01;
-const STATS_LEN: usize = 60; // time period (in secs) to keep in deltas
 
 // This will end up being something more sophisticated, I'm sure
 type Delta = usize;
 type Deltas = Vec<Delta>;
 type DeltasTotalTime = usize;
 
-fn setup_signal_handler() -> Arc<AtomicBool> {
-    let gotsig = Arc::new(AtomicBool::new(false));
-    let mut signals = Signals::new([SIGINT, SIGHUP, SIGTERM]).expect("Failed to register signals");
-
-    let gotsig_clone = Arc::clone(&gotsig);
-
-    thread::spawn(move || {
-        for sig in signals.forever() {
-            println!("Received signal: {}", sig);
-            gotsig_clone.store(true, Ordering::SeqCst);
-        }
-    });
-
-    gotsig
-}
-
 fn get_pci_intr_kstats() {
     todo!()
 }
 
-// getstat() is responsible for reading the kstats and generating a "stat" hash.
+struct Ivecs {
+    //     ->{<cookie#>}     iterates over pci_intrs::<nexus>:cookie
+    time: u64,       // pci_intrs:<ivec#>:<nexus>:time (in nsec)
+    pil: u64,        // pci_intrs:<ivec#>:<nexus>:pil
+    crtime: u64,     // pci_intrs:<ivec#>:<nexus>:crtime
+    ino: u64,        // pci_intrs:<ivec#>:<nexus>:ino
+    num_ino: u64, // num inos of single device instance sharing this entry. Will be > 1 on pcplusmp X86 systems for devices with multiple MSI interrupts.
+    buspath: String, // pci_intrs:<ivec#>:<nexus>:buspath
+    name: String, // pci_intrs:<ivec#>:<nexus>:name
+    ihs: u64,     // pci_intrs:<ivec#>:<nexus>:ihs
+}
+
+struct CpuStat {
+    tot: u64,    // cpu:<cpuid>:sys:cpu_nsec_{user + kernel + idle}
+    crtime: u64, // cpu:<cpuid>:sys:crtime
+    ivecs: Ivecs,
+}
+
+type CpuId = u8;
+
+struct GotStat {
+    snaptime: u64,                 // kstat's snaptime
+    cpus: HashMap<CpuId, CpuStat>, // one hash reference per online cpu
+}
+
+// # getstat() is responsible for reading the kstats and generating a "stat" hash.
+// #
+// # generate_delta() is responsible for taking two "stat" hashes and creating
+// # a new "delta" hash that represents what has changed over time.
+// #
+// # compress_deltas() is responsible for taking a list of deltas and generating
+// # a single delta hash that encompasses all the time periods described by the
+// # deltas.
+// # getstat() is handed a reference to a kstat and generates a hash, returned
+// # by reference, containing all the fields from the kstats which we need.
+// # If it returns the scalar 0, it failed to gather the kstats, and the caller
+// # should react accordingly.
+// #
+// # getstat() is also responsible for maintaining a reasonable $sleeptime.
+
 fn getstat(ctl: &Ctl, is_apic: bool) {
-    // 2 args
+    // kstats are not generated atomically. Each kstat hierarchy will
+    // have been generated within the kernel at a different time. On a
+    // thrashing system, we may not run quickly enough in order to get
+    // coherent kstat timing information across all the kstats. To
+    // determine if this is occurring, $minsnap/$maxsnap are used to
+    // find the breadth between the first and last snaptime of all the
+    // kstats we access. $maxsnap - $minsnap roughly represents the
+    // total time taken up in getstat(). If this time approaches the
+    // time between snapshots, our results may not be useful.
+
+    let mut minsnap = -1;
+    let mut maxsnap = -1;
+
+    // Hash of hash which matches (MSI device, ino) combos to kstats.
+    // my %msidevs = ();
+
+    // Iterate over the cpus in cpu:<cpuid>::. Check
+    // cpu_info:<cpuid>:cpu_info<cpuid>:state to make sure the
+    // processor is "on-line". If not, it isn't accepting interrupts
+    // and doesn't concern us.
+    //
+    // Record cpu:<cpuid>:sys:snaptime, and check $minsnap/$maxsnap.
 }
 
 // generate_delta() is responsible for taking two "stat" hashes and creating a new "delta" hash
@@ -109,61 +142,9 @@ fn do_reconfig_cpu() {
     todo!()
 }
 
-fn in_debug_mode() -> anyhow::Result<bool> {
-    let args: Vec<String> = env::args().collect();
-
-    // Parse arguments. intrd does not accept any public arguments; the two
-    // arguments below are meant for testing purposes. -D generates a significant
-    // amount of syslog output. -S <filename> loads the filename as a perl
-    // script. That file is expected to implement a kstat "simulator" which
-    // can be used to feed information to intrd and verify intrd's responses.
-
-    if args.len() > 1 {
-        return Err(anyhow!("The only valid argument is '-D' or '--debug'."));
-    }
-
-    Ok(args.len() == 2 && (args[1] == "-D" || args[1] == "--debug"))
-}
-
-fn setup_logger() -> std::result::Result<(), log::SetLoggerError> {
-    // TODO intrd logs to syslog. Logging to syslog from Rust on illumos is a pain, because none
-    // of the syslog crates I can find will write STREAMS. So we'll just use simplelog for now. In
-    // the unlikely event of this thing ever being completed and proven good, I'll write a syslog
-    // interface.
-    TermLogger::init(
-        LevelFilter::Debug,
-        Config::default(),
-        TerminalMode::Mixed,
-        ColorChoice::Auto,
-    )
-}
-
-fn is_apic_system(ctl: &Ctl, first_stat: &mut Kstat) -> anyhow::Result<bool> {
-    let bus_path = match ctl.read(first_stat) {
-        Ok(kstat_rs::Data::Named(stat)) => {
-            stat.iter()
-                .find(|s| s.name == "buspath")
-                .and_then(|buspath_stat| {
-                    if let NamedData::String(val) = buspath_stat.value {
-                        Some(val)
-                    } else {
-                        None
-                    }
-                })
-        }
-        Ok(_) => None,
-        Err(_) => None,
-    };
-
-    match bus_path {
-        Some(path) => is_apic::is_apic(path),
-        None => Err(anyhow!("Could not find buspath kstat")),
-    }
-}
-
 fn main() -> anyhow::Result<()> {
-    setup_logger().context("Failed to instantiate logger")?;
-    let debug = in_debug_mode()?;
+    helpers::setup_logger().context("Failed to instantiate logger")?;
+    let debug = helpers::in_debug_mode()?;
 
     if debug {
         debug!("{} is starting (debug)", SYSLOG_PROCESS_NAME);
@@ -171,7 +152,7 @@ fn main() -> anyhow::Result<()> {
         info!("{} is starting", SYSLOG_PROCESS_NAME);
     }
 
-    let gotsig = setup_signal_handler();
+    let gotsig = helpers::setup_signal_handler();
 
     // let mut deltas = Vec::new();
     // my @deltas = ();
@@ -234,7 +215,7 @@ fn main() -> anyhow::Result<()> {
     // # Such systems will get special handling.
     // # Assume that if one bus has a pcplusmp APIC that they all do.
 
-    let is_apic = is_apic_system(&ctl, first_stat)?;
+    let is_apic = helpers::is_apic_system(&ctl, first_stat)?;
 
     debug!("APIC system: {:?}", is_apic);
     let mut sleep_time = NORMAL_SLEEP_TIME;
@@ -300,41 +281,6 @@ fn main() -> anyhow::Result<()> {
         // # If $ret is 0, then nothing has happened because we're already
         // # good enough. Set baseline_goodness to current goodness.
     }
-
-    // # getstat() is responsible for reading the kstats and generating a "stat" hash.
-    // #
-    // # generate_delta() is responsible for taking two "stat" hashes and creating
-    // # a new "delta" hash that represents what has changed over time.
-    // #
-    // # compress_deltas() is responsible for taking a list of deltas and generating
-    // # a single delta hash that encompasses all the time periods described by the
-    // # deltas.
-    // # getstat() is handed a reference to a kstat and generates a hash, returned
-    // # by reference, containing all the fields from the kstats which we need.
-    // # If it returns the scalar 0, it failed to gather the kstats, and the caller
-    // # should react accordingly.
-    // #
-    // # getstat() is also responsible for maintaining a reasonable $sleeptime.
-    // #
-    // # {"snaptime"}          kstat's snaptime
-    // # {<cpuid>}             one hash reference per online cpu
-    // #  ->{"tot"}            == cpu:<cpuid>:sys:cpu_nsec_{user + kernel + idle}
-    // #  ->{"crtime"}         == cpu:<cpuid>:sys:crtime
-    // #  ->{"ivecs"}
-    // #     ->{<cookie#>}     iterates over pci_intrs::<nexus>:cookie
-    // #        ->{"time"}     == pci_intrs:<ivec#>:<nexus>:time (in nsec)
-    // #        ->{"pil"}      == pci_intrs:<ivec#>:<nexus>:pil
-    // #        ->{"crtime"}   == pci_intrs:<ivec#>:<nexus>:crtime
-    // #        ->{"ino"}      == pci_intrs:<ivec#>:<nexus>:ino
-    // #        ->{"num_ino"}  == num inos of single device instance sharing this entry
-    // #				Will be > 1 on pcplusmp X86 systems for devices
-    // #				with multiple MSI interrupts.
-    // #        ->{"buspath"}  == pci_intrs:<ivec#>:<nexus>:buspath
-    // #        ->{"name"}     == pci_intrs:<ivec#>:<nexus>:name
-    // #        ->{"ihs"}      == pci_intrs:<ivec#>:<nexus>:ihs
-    // #
-    //
-    //
 
     Ok(())
 }

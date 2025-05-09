@@ -1,14 +1,11 @@
+use crate::util::constants::{
+    PCITOOL_CTLR_TYPE_APIX, PCITOOL_CTLR_TYPE_PCPLUSMP, PCITOOL_SYSTEM_INTR_INFO, PCITOOL_VERSION,
+};
 use anyhow::anyhow;
 use libc::ioctl;
 use std::fs::OpenOptions;
 use std::io;
 use std::os::fd::AsRawFd;
-
-const PCITOOL_CTLR_TYPE_APIX: u8 = 4;
-const PCITOOL_CTLR_TYPE_PCPLUSMP: u8 = 3;
-const PCITOOL_SYSTEM_INTR_INFO: u32 =
-    (('P' as u32) << 24) | (('C' as u32) << 16) | (('T' as u32) << 8) | 8;
-const PCITOOL_VERSION: u16 = 2;
 
 #[repr(C)]
 pub struct PciToolIntrInfo {
@@ -44,3 +41,29 @@ pub fn is_apic(buspath: &str) -> anyhow::Result<bool> {
 
     Ok(iinfo.ctlr_type == PCITOOL_CTLR_TYPE_PCPLUSMP || iinfo.ctlr_type == PCITOOL_CTLR_TYPE_APIX)
 }
+
+// pub fn intrmove(path: &str, oldcpu: i32, ino: i32, cpu: i32, num_ino: i32) -> io::Result<()> {
+//     let fd = open_dev(path)?;
+
+//     let flags = if num_ino > 1 {
+//         PCITOOL_INTR_FLAG_SET_GROUP
+//     } else {
+//         0
+//     };
+
+//     let iset = PciToolIntrSet {
+//         cpu_id: cpu,
+//         flags,
+//         ino,
+//         old_cpu: oldcpu,
+//         user_version: PCITOOL_VERSION,
+//     };
+
+//     let ret = unsafe { libc::ioctl(fd, PCITOOL_DEVICE_SET_INTR, &iset) };
+
+//     if ret == -1 {
+//         Err(io::Error::last_os_error())
+//     } else {
+//         Ok(())
+//     }
+// }
