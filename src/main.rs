@@ -1,6 +1,10 @@
 use crate::util::constants::{NORMAL_SLEEP_TIME, SYSLOG_PROCESS_NAME, USING_SCENGEN};
+use kstat_rs::NamedData::Char as KChar;
+use kstat_rs::NamedData::String as KString;
+use kstat_rs::NamedData::UInt64;
+
 use crate::util::helpers;
-use kstat_rs::{Ctl, Kstat, NamedData};
+use kstat_rs::{Ctl, Data, Kstat, Named, NamedData, NamedType};
 use log::{debug, info};
 use simplelog::{ColorChoice, Config, LevelFilter, TermLogger, TerminalMode};
 use std::collections::HashMap;
@@ -15,10 +19,6 @@ use anyhow::Context;
 type Delta = usize;
 type Deltas = Vec<Delta>;
 type DeltasTotalTime = usize;
-
-fn get_pci_intr_kstats() {
-    todo!()
-}
 
 struct Ivecs {
     //     ->{<cookie#>}     iterates over pci_intrs::<nexus>:cookie
@@ -37,8 +37,6 @@ struct CpuStat {
     crtime: u64, // cpu:<cpuid>:sys:crtime
     ivecs: Ivecs,
 }
-
-type CpuId = u8;
 
 struct GotStat {
     snaptime: u64,                 // kstat's snaptime
@@ -60,7 +58,36 @@ struct GotStat {
 // #
 // # getstat() is also responsible for maintaining a reasonable $sleeptime.
 
-fn getstat(ctl: &Ctl, is_apic: bool) {
+fn get_string_value(stat: &Named) -> anyhow::Result<String> {
+    if let NamedData::Char(bytes) = stat.value {
+        Ok(std::str::from_utf8(bytes)?.trim_matches('\0').to_string())
+    } else {
+        Err(anyhow!("not valid UTF8"))
+    }
+}
+
+type CpuId = i32;
+
+fn online_cpus(ctl: &Ctl) -> anyhow::Result<Vec<CpuId>> {
+    Ok(ctl
+        .filter(Some("cpu_info"), None, None)
+        .filter_map(|mut cpu| {
+            if let Ok(Data::Named(val)) = ctl.read(&mut cpu) {
+                val.iter().find(|x| x.name == "state").and_then(|c| {
+                    if get_string_value(c).ok()? == "on-line" {
+                        Some(cpu.ks_instance)
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            }
+        })
+        .collect())
+}
+
+fn getstat(ctl: &Ctl, is_apic: bool) -> anyhow::Result<Option<GotStat>> {
     // kstats are not generated atomically. Each kstat hierarchy will
     // have been generated within the kernel at a different time. On a
     // thrashing system, we may not run quickly enough in order to get
@@ -71,18 +98,99 @@ fn getstat(ctl: &Ctl, is_apic: bool) {
     // total time taken up in getstat(). If this time approaches the
     // time between snapshots, our results may not be useful.
 
-    let mut minsnap = -1;
-    let mut maxsnap = -1;
+    // let mut minsnap = -1;
+    // let mut maxsnap = -1;
 
     // Hash of hash which matches (MSI device, ino) combos to kstats.
     // my %msidevs = ();
 
-    // Iterate over the cpus in cpu:<cpuid>::. Check
-    // cpu_info:<cpuid>:cpu_info<cpuid>:state to make sure the
-    // processor is "on-line". If not, it isn't accepting interrupts
-    // and doesn't concern us.
-    //
     // Record cpu:<cpuid>:sys:snaptime, and check $minsnap/$maxsnap.
+
+    let online_cpus = online_cpus(&ctl)?;
+
+    if online_cpus.len() <= 1 {
+        return Ok(None);
+    }
+
+    let mut snaptimes = Vec::new();
+
+    for cpu_id in &online_cpus {
+        let mut cpu_sys: Vec<_> = ctl
+            .filter(Some("cpu"), Some(*cpu_id), Some("sys"))
+            .collect();
+        // This is bound to be a single element vector
+        let mut this_cpu = cpu_sys
+            .first_mut()
+            .context(format!("failed to find cpu:{}:sys", cpu_id))?;
+
+        snaptimes.push(this_cpu.ks_snaptime);
+
+        if let Ok(Data::Named(val)) = ctl.read(this_cpu) {
+            let vals = numeric_value_map(&val);
+            // I'm surprised we count idle time, but that's what the original does
+            let cpu_time: u64 = numeric_value_map(&val)
+                .iter()
+                .filter_map(|(k, v)| k.starts_with("cpu_nsec").then_some(*v))
+                .sum();
+            let cpu_crtime = vals.get("crtime").context("could not get crtime");
+        }
+    }
+
+    let mut pci_intrs: Vec<_> = ctl.filter(Some("pci_intrs"), None, None).collect();
+
+    for mut pci_intr in pci_intrs {
+        // println!("{:?}", pci_intr);
+        // let vals = numeric_value_map(&val);
+        // let mut this_cpu = pci_intr
+        //     .first_mut()
+        //     .context("failed to find pci_intr kstat")?;
+        // println!("----------------------");
+        // println!("{:#?}", this_cpu);
+        // for mut x in pci_intrs {
+        snaptimes.push(pci_intr.ks_snaptime);
+
+        if let Ok(Data::Named(val)) = ctl.read(&mut pci_intr) {
+            let nvals = numeric_value_map(&val);
+            let svals = string_value_map(&val);
+            let cpu_id = nvals.get("cpu").context("failed to get pci_intr cpu")?;
+
+            if !&online_cpus.contains(&(*cpu_id as i32)) {
+                continue;
+            }
+
+            if *svals.get("type").context("failed to get pci_intr type")? == "disabled" {
+                continue;
+            }
+        }
+        // }
+    }
+
+    todo!()
+}
+type KstatNumericValueMap<'a> = HashMap<&'a str, u64>;
+type KstatStrinValueMap<'a> = HashMap<&'a str, &'a str>;
+// use kstat::Data::Named;
+// use kstat::NamedVal::UInt64;
+
+fn numeric_value_map<'a>(named: &'a [Named]) -> KstatNumericValueMap<'a> {
+    named
+        .iter()
+        .filter_map(|n| match n.value {
+            UInt64(v) => Some((n.name, v)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn string_value_map<'a>(named: &'a [Named]) -> KstatStrinValueMap<'a> {
+    named
+        .iter()
+        .filter_map(|n| match n.value {
+            KString(v) => Some((n.name, v)),
+            KChar(v) => Some((n.name, std::str::from_utf8(v).unwrap().trim_matches('\0'))),
+            _ => None,
+        })
+        .collect()
 }
 
 // generate_delta() is responsible for taking two "stat" hashes and creating a new "delta" hash
@@ -189,6 +297,9 @@ fn main() -> anyhow::Result<()> {
     //
     let mut ctl = Ctl::new().context("Cannot get kstat handle")?;
     let mut intr_stats: Vec<_> = ctl.filter(Some("pci_intrs"), None, None).collect();
+
+    // From inside loop
+    let stats = getstat(&ctl, true);
 
     // # If no pci_intrs kstats were found, we need to exit, but we can't because
     // # SMF will restart us and/or report an error to the administrator. But
